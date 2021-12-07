@@ -231,6 +231,7 @@ func (dn *Daemon) Run(stopCh <-chan struct{}, exitCh <-chan error) error {
 	defer dn.workqueue.ShutDown()
 
 	tryEnableRdma()
+	tryEnableTun()
 
 	if err := sriovnetworkv1.InitNicIdMap(dn.kubeClient, namespace); err != nil {
 		return err
@@ -504,11 +505,14 @@ func (dn *Daemon) nodeStateSyncHandler(generation int64) error {
 	}
 
 	if !reqReboot {
-		// Apply generic_plugin last
-		err = dn.LoadedPlugins[GenericPlugin].Apply()
-		if err != nil {
-			glog.Errorf("nodeStateSyncHandler(): generic_plugin fail to apply: %v", err)
-			return err
+		plugin, ok := dn.LoadedPlugins[GenericPlugin]
+		if ok {
+			// Apply generic_plugin last
+			err = plugin.Apply()
+			if err != nil {
+				glog.Errorf("nodeStateSyncHandler(): generic_plugin fail to apply: %v", err)
+				return err
+			}
 		}
 	}
 
@@ -519,14 +523,11 @@ func (dn *Daemon) nodeStateSyncHandler(generation int64) error {
 	}
 
 	// restart device plugin pod
-	if reqDrain || latestState.Spec.DpConfigVersion != dn.nodeState.Spec.DpConfigVersion {
-		glog.Info("nodeStateSyncHandler(): restart device plugin pod")
-		if err := dn.restartDevicePluginPod(); err != nil {
-			glog.Errorf("nodeStateSyncHandler(): fail to restart device plugin pod: %v", err)
-			return err
-		}
+	glog.Info("nodeStateSyncHandler(): restart device plugin pod")
+	if err := dn.restartDevicePluginPod(); err != nil {
+		glog.Errorf("nodeStateSyncHandler(): fail to restart device plugin pod: %v", err)
+		return err
 	}
-
 	if anno, ok := dn.node.Annotations[annoKey]; ok && (anno == annoDraining || anno == annoMcpPaused) {
 		if err := dn.completeDrain(); err != nil {
 			glog.Errorf("nodeStateSyncHandler(): failed to complete draining: %v", err)
@@ -775,6 +776,11 @@ func (dn *Daemon) getDrainLock(ctx context.Context, done chan bool) {
 				glog.V(2).Info("getDrainLock(): started leading")
 				for {
 					time.Sleep(3 * time.Second)
+					if dn.node.Annotations[annoKey] == annoMcpPaused {
+						// The node in Draining_MCP_Paused state, no other node is draining. Skip drainable checking
+						done <- true
+						return
+					}
 					if dn.drainable {
 						glog.V(2).Info("getDrainLock(): no other node is draining")
 						err = dn.annotateNode(dn.name, annoDraining)
@@ -831,7 +837,7 @@ func (dn *Daemon) drainNode(name string) error {
 				mcfgv1.IsMachineConfigPoolConditionFalse(newMcp.Status.Conditions, mcfgv1.MachineConfigPoolUpdating) {
 				glog.V(2).Infof("drainNode(): MCP %s is ready", dn.mcpName)
 				if paused {
-					glog.V(2).Info("drainNode(): stop MCP informer", dn.mcpName)
+					glog.V(2).Info("drainNode(): stop MCP informer")
 					cancel()
 					return
 				}
@@ -878,9 +884,14 @@ func (dn *Daemon) drainNode(name string) error {
 				mcpEventHandler(new)
 			},
 		})
-		mcpInformerFactory.Start(ctx.Done())
-		mcpInformerFactory.WaitForCacheSync(ctx.Done())
-		<-ctx.Done()
+
+		// The Draining_MCP_Paused state means the MCP work has been paused by the config daemon in previous round.
+		// Only check MCP state if the node is not in Draining_MCP_Paused state
+		if !paused {
+			mcpInformerFactory.Start(ctx.Done())
+			mcpInformerFactory.WaitForCacheSync(ctx.Done())
+			<-ctx.Done()
+		}
 	}
 
 	backoff := wait.Backoff{
@@ -930,6 +941,12 @@ func registerPlugins(ns *sriovnetworkv1.SriovNetworkNodeState) []string {
 		nameList[i] = rawList[i].String()
 	}
 	return nameList
+}
+
+func tryEnableTun() {
+	if err := utils.LoadKernelModule("tun"); err != nil {
+		glog.Errorf("tryEnableTun(): TUN kernel module not loaded: %v", err)
+	}
 }
 
 func tryEnableRdma() (bool, error) {
